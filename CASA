@@ -70,53 +70,6 @@ Landcover_collection        = Landcover_collection.map(reprojectandclip);
 
 // ======================= 工具函数 ======================= //
 
-// 位运算提取
-var bitwiseExtract = function(input, fromBit, toBit) {
-  var maskSize = ee.Number(1).add(toBit).subtract(fromBit);
-  var mask = ee.Number(1).leftShift(maskSize).subtract(1);
-  return input.rightShift(fromBit).bitwiseAnd(mask);
-};
-
-// MOD09/MYD09 QA 筛云
-function MOD09GA_QC_FC(image) {
-  var qc_500_MOD = image.select('state_1km_MOD');
-  var cloud_state_MOD    = bitwiseExtract(qc_500_MOD, 0, 1).eq(0);
-  var cloud_shadow_MOD   = bitwiseExtract(qc_500_MOD, 2, 2).eq(0);
-  var cirrus_MOD         = bitwiseExtract(qc_500_MOD, 8, 9).lte(1);
-  var cloud_algorithm_MOD= bitwiseExtract(qc_500_MOD,10,10).eq(0);
-  var mask_MOD = cloud_state_MOD.and(cloud_shadow_MOD)
-                                .and(cirrus_MOD)
-                                .and(cloud_algorithm_MOD);
-  var MODBands = image.select('sur_refl_MOD_b0.').updateMask(mask_MOD).multiply(0.0001);
-
-  var qc_500_MYD = image.select('state_1km_MYD');
-  var cloud_state_MYD    = bitwiseExtract(qc_500_MYD, 0, 1).eq(0);
-  var cloud_shadow_MYD   = bitwiseExtract(qc_500_MYD, 2, 2).eq(0);
-  var cirrus_MYD         = bitwiseExtract(qc_500_MYD, 8, 9).lte(1);
-  var cloud_algorithm_MYD= bitwiseExtract(qc_500_MYD,10,10).eq(0);
-  var mask_MYD = cloud_state_MYD.and(cloud_shadow_MYD)
-                                .and(cirrus_MYD)
-                                .and(cloud_algorithm_MYD);
-  var MYDBands = image.select('sur_refl_MYD_b0.').updateMask(mask_MYD).multiply(0.0001);
-
-  return image.addBands(MODBands, null, true)
-              .addBands(MYDBands, null, true);
-}
-
-function MOD09GA_QC(image) {
-  var qc_500 = image.select('state_1km');
-  var cloud_state   = bitwiseExtract(qc_500, 0, 1).eq(0);
-  var cloud_shadow  = bitwiseExtract(qc_500, 2, 2).eq(0);
-  var cirrus        = bitwiseExtract(qc_500, 8, 9).lte(1);
-  var cloud_algorithm = bitwiseExtract(qc_500,10,10).eq(0);
-  var mask = cloud_state.and(cloud_shadow)
-                        .and(cirrus)
-                        .and(cloud_algorithm);
-  var Bands = image.select('sur_refl_b0.').updateMask(mask).multiply(0.0001);
-
-  return image.addBands(Bands, null, true);
-}
-
 // Inner join by time
 var innerJoin = ee.Join.inner();
 var filterTimeEq = ee.Filter.equals({
@@ -156,23 +109,37 @@ var MODIS_09 = ee.ImageCollection(innerJoinedMOD09.map(function(feature){
   return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
 }));
 
-var MODIS09GA_qc = MODIS_09
-  .map(MOD09GA_QC_FC)
+var MODIS09GA_scaled = MODIS_09
+  .map(function(image) {
+    var MODBands = image.select(
+      ['sur_refl_MOD_b01','sur_refl_MOD_b02','sur_refl_MOD_b03','sur_refl_MOD_b04',
+       'sur_refl_MOD_b05','sur_refl_MOD_b06','sur_refl_MOD_b07']
+    ).multiply(0.0001);
+
+    var MYDBands = image.select(
+      ['sur_refl_MYD_b01','sur_refl_MYD_b02','sur_refl_MYD_b03','sur_refl_MYD_b04',
+       'sur_refl_MYD_b05','sur_refl_MYD_b06','sur_refl_MYD_b07']
+    ).multiply(0.0001);
+
+    return image.addBands(MODBands, null, true)
+                .addBands(MYDBands, null, true);
+  })
   .select([
     'sur_refl_MOD_b01','sur_refl_MOD_b02','sur_refl_MOD_b03','sur_refl_MOD_b04',
-    'sur_refl_MOD_b05','sur_refl_MOD_b06','sur_refl_MOD_b07','state_1km_MOD',
+    'sur_refl_MOD_b05','sur_refl_MOD_b06','sur_refl_MOD_b07',
     'sur_refl_MYD_b01','sur_refl_MYD_b02','sur_refl_MYD_b03','sur_refl_MYD_b04',
     'sur_refl_MYD_b05','sur_refl_MYD_b06','sur_refl_MYD_b07'
   ]);
 
-var MOD09GA_collection_fir2y_qc = MOD09GA_collection_fir2y
-  .map(MOD09GA_QC)
-  .select(
-    ['sur_refl_b01','sur_refl_b02','sur_refl_b03','sur_refl_b04',
-     'sur_refl_b05','sur_refl_b06','sur_refl_b07'],
-    ['MODIS_Band1','MODIS_Band2','MODIS_Band3','MODIS_Band4',
-     'MODIS_Band5','MODIS_Band6','MODIS_Band7']
-  );
+var MOD09GA_collection_fir2y_scaled = MOD09GA_collection_fir2y
+  .map(function(image) {
+    return image.select(
+      ['sur_refl_b01','sur_refl_b02','sur_refl_b03','sur_refl_b04',
+       'sur_refl_b05','sur_refl_b06','sur_refl_b07']
+    ).multiply(0.0001)
+     .rename(['MODIS_Band1','MODIS_Band2','MODIS_Band3','MODIS_Band4',
+              'MODIS_Band5','MODIS_Band6','MODIS_Band7']);
+  });
 
 // Terra/Aqua 同日平均
 function sameday_average(image) {
@@ -209,7 +176,7 @@ function sameday_average(image) {
               .toFloat();
 }
 
-var MODIS09GA_average = MODIS09GA_qc
+var MODIS09GA_average = MODIS09GA_scaled
   .map(sameday_average)
   .select([
     'MODIS_Band1','MODIS_Band2','MODIS_Band3',
@@ -220,10 +187,10 @@ function avoid_data_type_error(image) {
   return image.toFloat();
 }
 
-MOD09GA_collection_fir2y_qc = MOD09GA_collection_fir2y_qc.map(avoid_data_type_error);
+MOD09GA_collection_fir2y_scaled = MOD09GA_collection_fir2y_scaled.map(avoid_data_type_error);
 
 // 日尺度 Terra & Terra/Aqua 合并序列
-var MODIS09GA_Daily_averaged = MOD09GA_collection_fir2y_qc.merge(MODIS09GA_average);
+var MODIS09GA_Daily_averaged = MOD09GA_collection_fir2y_scaled.merge(MODIS09GA_average);
 
 // ======================= 土地覆被 & 参数映射 ======================= //
 
