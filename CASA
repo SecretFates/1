@@ -1,0 +1,722 @@
+// ======================= 研究区 & 可视化 ======================= //
+
+// 研究区：使用导入的塔里木河流域矢量（命名为 table）
+var geom = table.geometry();
+Map.addLayer(geom, {}, 'Tarim Basin ROI');
+
+// ======================= 数据准备 ======================= //
+
+// 年份范围（CASA 主体模拟）
+var startYear = 2001;
+var endYear   = 2010;   // 至少包含 2010
+
+// 气候数据：TERRACLIMATE（降水、最低温、最高温、太阳辐射）
+var Climate_collection = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+  .filter(ee.Filter.date(startYear + '-01-01', endYear + '-12-31'))
+  .select(['pr', 'tmmn', 'tmmx', 'srad']);
+
+// MODIS 反射率：Terra 早期 + Terra/Aqua 组合
+var MOD09GA_collection_fir2y = ee.ImageCollection('MODIS/061/MOD09GA')
+  .filter(ee.Filter.date('2001-01-01', '2002-08-08'));
+
+var MOD09GA_collection_lateryears = ee.ImageCollection('MODIS/061/MOD09GA')
+  .filter(ee.Filter.date('2002-08-08', endYear + '-12-31'));
+
+var MYD09GA_collection = ee.ImageCollection('MODIS/061/MYD09GA')
+  .filter(ee.Filter.date('2002-08-08', endYear + '-12-31'));
+
+// 土地覆被：MCD12Q1 所有年份
+var Landcover_collection = ee.ImageCollection('MODIS/061/MCD12Q1')
+  .select('LC_Type1');
+
+// 统一投影 + 裁剪
+function reprojectandclip(image) {
+  return image
+    .reproject('EPSG:4326', null, 500)
+    .clip(geom);
+}
+
+// 辐射、温度、降水等 QC及派生变量
+function solar_radiation_qc(image) {
+  var srad = image.select('srad').multiply(0.1).multiply(2.592); // 单位换算
+  var tmmn = image.select('tmmn').multiply(0.1);
+  var tmmx = image.select('tmmx').multiply(0.1);
+  var pr   = image.select('pr');
+  var tmean = tmmn.add(tmmx).divide(2).rename('tmean');
+
+  var datestr = image.get('system:time_start');
+  var year  = ee.Date(datestr).get('year');
+  var month = ee.Date(datestr).get('month');
+
+  // Thornthwaite I_month 近似
+  var I_month = tmean.divide(5).pow(1.514).rename('I_month');
+
+  return image.addBands(srad, null, true)
+              .addBands(tmmn, null, true)
+              .addBands(tmmx, null, true)
+              .addBands(pr,   null, true)
+              .addBands(tmean)
+              .addBands(I_month)
+              .set('year', year)
+              .set('month', month)
+              .set('yearmonth', ee.Date(datestr).format('YYYYMM'));
+}
+
+Climate_collection          = Climate_collection.map(solar_radiation_qc).map(reprojectandclip);
+MOD09GA_collection_fir2y    = MOD09GA_collection_fir2y.map(reprojectandclip);
+MOD09GA_collection_lateryears = MOD09GA_collection_lateryears.map(reprojectandclip);
+MYD09GA_collection          = MYD09GA_collection.map(reprojectandclip);
+Landcover_collection        = Landcover_collection.map(reprojectandclip);
+
+// ======================= 工具函数 ======================= //
+
+// 位运算提取
+var bitwiseExtract = function(input, fromBit, toBit) {
+  var maskSize = ee.Number(1).add(toBit).subtract(fromBit);
+  var mask = ee.Number(1).leftShift(maskSize).subtract(1);
+  return input.rightShift(fromBit).bitwiseAnd(mask);
+};
+
+// MOD09/MYD09 QA 筛云
+function MOD09GA_QC_FC(image) {
+  var qc_500_MOD = image.select('state_1km_MOD');
+  var cloud_state_MOD    = bitwiseExtract(qc_500_MOD, 0, 1).eq(0);
+  var cloud_shadow_MOD   = bitwiseExtract(qc_500_MOD, 2, 2).eq(0);
+  var cirrus_MOD         = bitwiseExtract(qc_500_MOD, 8, 9).lte(1);
+  var cloud_algorithm_MOD= bitwiseExtract(qc_500_MOD,10,10).eq(0);
+  var mask_MOD = cloud_state_MOD.and(cloud_shadow_MOD)
+                                .and(cirrus_MOD)
+                                .and(cloud_algorithm_MOD);
+  var MODBands = image.select('sur_refl_MOD_b0.').updateMask(mask_MOD).multiply(0.0001);
+
+  var qc_500_MYD = image.select('state_1km_MYD');
+  var cloud_state_MYD    = bitwiseExtract(qc_500_MYD, 0, 1).eq(0);
+  var cloud_shadow_MYD   = bitwiseExtract(qc_500_MYD, 2, 2).eq(0);
+  var cirrus_MYD         = bitwiseExtract(qc_500_MYD, 8, 9).lte(1);
+  var cloud_algorithm_MYD= bitwiseExtract(qc_500_MYD,10,10).eq(0);
+  var mask_MYD = cloud_state_MYD.and(cloud_shadow_MYD)
+                                .and(cirrus_MYD)
+                                .and(cloud_algorithm_MYD);
+  var MYDBands = image.select('sur_refl_MYD_b0.').updateMask(mask_MYD).multiply(0.0001);
+
+  return image.addBands(MODBands, null, true)
+              .addBands(MYDBands, null, true);
+}
+
+function MOD09GA_QC(image) {
+  var qc_500 = image.select('state_1km');
+  var cloud_state   = bitwiseExtract(qc_500, 0, 1).eq(0);
+  var cloud_shadow  = bitwiseExtract(qc_500, 2, 2).eq(0);
+  var cirrus        = bitwiseExtract(qc_500, 8, 9).lte(1);
+  var cloud_algorithm = bitwiseExtract(qc_500,10,10).eq(0);
+  var mask = cloud_state.and(cloud_shadow)
+                        .and(cirrus)
+                        .and(cloud_algorithm);
+  var Bands = image.select('sur_refl_b0.').updateMask(mask).multiply(0.0001);
+
+  return image.addBands(Bands, null, true);
+}
+
+// Inner join by time
+var innerJoin = ee.Join.inner();
+var filterTimeEq = ee.Filter.equals({
+  leftField:  'system:time_start',
+  rightField: 'system:time_start'
+});
+
+// Terra/Aqua 同日平均
+var Cal_terra_aqua_average_value = function(terra, aqua) {
+  var data = terra.unmask(0).add(aqua.unmask(0));
+  var mask = terra.mask().add(aqua.mask());
+  var mask_for_multiply = mask.where(mask.eq(0), 10).pow(-1);
+  var mask_for_update   = mask.where(mask.gt(0), 1);
+  var average_value = data.multiply(mask_for_multiply)
+                          .updateMask(mask_for_update);
+  return average_value;
+};
+
+// ======================= MOD09 处理 ======================= //
+
+var MOD09GA = MOD09GA_collection_lateryears.select(
+  ['sur_refl_b01','sur_refl_b02','sur_refl_b03','sur_refl_b04',
+   'sur_refl_b05','sur_refl_b06','sur_refl_b07','state_1km'],
+  ['sur_refl_MOD_b01','sur_refl_MOD_b02','sur_refl_MOD_b03','sur_refl_MOD_b04',
+   'sur_refl_MOD_b05','sur_refl_MOD_b06','sur_refl_MOD_b07','state_1km_MOD']
+);
+
+var MYD09GA = MYD09GA_collection.select(
+  ['sur_refl_b01','sur_refl_b02','sur_refl_b03','sur_refl_b04',
+   'sur_refl_b05','sur_refl_b06','sur_refl_b07','state_1km'],
+  ['sur_refl_MYD_b01','sur_refl_MYD_b02','sur_refl_MYD_b03','sur_refl_MYD_b04',
+   'sur_refl_MYD_b05','sur_refl_MYD_b06','sur_refl_MYD_b07','state_1km_MYD']
+);
+
+var innerJoinedMOD09 = innerJoin.apply(MOD09GA, MYD09GA, filterTimeEq);
+var MODIS_09 = ee.ImageCollection(innerJoinedMOD09.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+var MODIS09GA_qc = MODIS_09
+  .map(MOD09GA_QC_FC)
+  .select([
+    'sur_refl_MOD_b01','sur_refl_MOD_b02','sur_refl_MOD_b03','sur_refl_MOD_b04',
+    'sur_refl_MOD_b05','sur_refl_MOD_b06','sur_refl_MOD_b07','state_1km_MOD',
+    'sur_refl_MYD_b01','sur_refl_MYD_b02','sur_refl_MYD_b03','sur_refl_MYD_b04',
+    'sur_refl_MYD_b05','sur_refl_MYD_b06','sur_refl_MYD_b07'
+  ]);
+
+var MOD09GA_collection_fir2y_qc = MOD09GA_collection_fir2y
+  .map(MOD09GA_QC)
+  .select(
+    ['sur_refl_b01','sur_refl_b02','sur_refl_b03','sur_refl_b04',
+     'sur_refl_b05','sur_refl_b06','sur_refl_b07'],
+    ['MODIS_Band1','MODIS_Band2','MODIS_Band3','MODIS_Band4',
+     'MODIS_Band5','MODIS_Band6','MODIS_Band7']
+  );
+
+// Terra/Aqua 同日平均
+function sameday_average(image) {
+  var MOD_Band1 = image.select('sur_refl_MOD_b01');
+  var MYD_Band1 = image.select('sur_refl_MYD_b01');
+  var MOD_Band2 = image.select('sur_refl_MOD_b02');
+  var MYD_Band2 = image.select('sur_refl_MYD_b02');
+  var MOD_Band3 = image.select('sur_refl_MOD_b03');
+  var MYD_Band3 = image.select('sur_refl_MYD_b03');
+  var MOD_Band4 = image.select('sur_refl_MOD_b04');
+  var MYD_Band4 = image.select('sur_refl_MYD_b04');
+  var MOD_Band5 = image.select('sur_refl_MOD_b05');
+  var MYD_Band5 = image.select('sur_refl_MYD_b05');
+  var MOD_Band6 = image.select('sur_refl_MOD_b06');
+  var MYD_Band6 = image.select('sur_refl_MYD_b06');
+  var MOD_Band7 = image.select('sur_refl_MOD_b07');
+  var MYD_Band7 = image.select('sur_refl_MYD_b07');
+
+  var averaged_Band1 = Cal_terra_aqua_average_value(MOD_Band1, MYD_Band1);
+  var averaged_Band2 = Cal_terra_aqua_average_value(MOD_Band2, MYD_Band2);
+  var averaged_Band3 = Cal_terra_aqua_average_value(MOD_Band3, MYD_Band3);
+  var averaged_Band4 = Cal_terra_aqua_average_value(MOD_Band4, MYD_Band4);
+  var averaged_Band5 = Cal_terra_aqua_average_value(MOD_Band5, MYD_Band5);
+  var averaged_Band6 = Cal_terra_aqua_average_value(MOD_Band6, MYD_Band6);
+  var averaged_Band7 = Cal_terra_aqua_average_value(MOD_Band7, MYD_Band7);
+
+  return image.addBands(averaged_Band1.rename('MODIS_Band1'))
+              .addBands(averaged_Band2.rename('MODIS_Band2'))
+              .addBands(averaged_Band3.rename('MODIS_Band3'))
+              .addBands(averaged_Band4.rename('MODIS_Band4'))
+              .addBands(averaged_Band5.rename('MODIS_Band5'))
+              .addBands(averaged_Band6.rename('MODIS_Band6'))
+              .addBands(averaged_Band7.rename('MODIS_Band7'))
+              .toFloat();
+}
+
+var MODIS09GA_average = MODIS09GA_qc
+  .map(sameday_average)
+  .select([
+    'MODIS_Band1','MODIS_Band2','MODIS_Band3',
+    'MODIS_Band4','MODIS_Band5','MODIS_Band6','MODIS_Band7'
+  ]);
+
+function avoid_data_type_error(image) {
+  return image.toFloat();
+}
+
+MOD09GA_collection_fir2y_qc = MOD09GA_collection_fir2y_qc.map(avoid_data_type_error);
+
+// 日尺度 Terra & Terra/Aqua 合并序列
+var MODIS09GA_Daily_averaged = MOD09GA_collection_fir2y_qc.merge(MODIS09GA_average);
+
+// ======================= 土地覆被 & 参数映射 ======================= //
+
+// 用 2021 年土地覆被填补缺口
+var landcover2022 = ee.Image('MODIS/061/MCD12Q1/2021_01_01')
+  .select('LC_Type1')
+  .set('system:time_start', 1640995200000)
+  .set('system:time_end',   1672531200000);
+
+var landcover_final = Landcover_collection.merge(landcover2022);
+
+// LUE 映射（保持你原来的数值）
+function generate_LUE(image){
+  var img = image.where(image.eq(3),  0.485).where(image.eq(1),  0.389)
+                 .where(image.eq(4),  0.692).where(image.eq(2),  0.985)
+                 .where(image.eq(5),  0.768).where(image.eq(6),  0.429)
+                 .where(image.eq(7),  0.429).where(image.eq(8),  0.542)
+                 .where(image.eq(9),  0.542).where(image.eq(10), 0.542)
+                 .where(image.eq(11), 0.542).where(image.eq(12), 0.542)
+                 .where(image.eq(13), 0.542).where(image.eq(14), 0.542)
+                 .where(image.eq(15), 0.542).where(image.eq(16), 0.542)
+                 .where(image.eq(17), 0.542);
+  return img.toFloat();
+}
+
+// ✅ 本地化 NDVI_min：来自 2001–2020 NDVI 统计
+function set_NDVImin(image){
+  var img = image;
+
+  // Forests（1–5）
+  img = img.where(img.eq(1), 0.723902);  // Evergreen Needleleaf
+  img = img.where(img.eq(2), 0.02);      // Evergreen Broadleaf（本区几乎没有）
+  img = img.where(img.eq(3), 0.791152);  // Deciduous Needleleaf
+  img = img.where(img.eq(4), 0.840655);  // Deciduous Broadleaf
+  img = img.where(img.eq(5), 0.80057);   // Mixed Forest
+
+  // Closed Shrublands（6）
+  img = img.where(img.eq(6), 0.05);
+
+  // Open Shrublands（7）
+  img = img.where(img.eq(7), 0.02);      // 原 p5 为负，抬到 0.02
+
+  // Woody savannas / savannas
+  img = img.where(img.eq(8), 0.729818);  // Woody savannas
+  img = img.where(img.eq(9), 0.455844);  // Savannas
+
+  // Grasslands
+  img = img.where(img.eq(10), 0.147414);
+
+  // Wetlands
+  img = img.where(img.eq(11), 0.331067);
+
+  // Croplands
+  img = img.where(img.eq(12), 0.461628);
+
+  // Urban and built-up
+  img = img.where(img.eq(13), 0.118445);
+
+  // Cropland/Natural mosaic
+  img = img.where(img.eq(14), 0.787639);
+
+  // Snow and ice
+  img = img.where(img.eq(15), 0.02);     // 负值改为 0.02
+
+  // Barren / Sparse
+  img = img.where(img.eq(16), 0.04437);
+
+  // Water
+  img = img.where(img.eq(17), 0.02);     // 负值改 0.02，避免 FPAR 崩溃
+
+  return img.toFloat();
+}
+
+// ✅ 本地化 NDVI_max：来自 2001–2020 NDVI 统计
+function set_NDVImax(image){
+  var img = image;
+
+  // Forests（1–5）
+  img = img.where(img.eq(1), 0.857646);
+  img = img.where(img.eq(2), 0.02541);
+  img = img.where(img.eq(3), 0.886831);
+  img = img.where(img.eq(4), 0.908595);
+  img = img.where(img.eq(5), 0.893643);
+
+  // Closed Shrublands（6）
+  img = img.where(img.eq(6), 0.55);
+
+  // Open Shrublands（7）
+  img = img.where(img.eq(7), 0.396249);
+
+  // Woody savannas / savannas
+  img = img.where(img.eq(8), 0.879337);
+  img = img.where(img.eq(9), 0.875743);
+
+  // Grasslands
+  img = img.where(img.eq(10), 0.772252);
+
+  // Wetlands
+  img = img.where(img.eq(11), 0.829672);
+
+  // Croplands
+  img = img.where(img.eq(12), 0.874693);
+
+  // Urban and built-up
+  img = img.where(img.eq(13), 0.76352);
+
+  // Cropland/Natural mosaic
+  img = img.where(img.eq(14), 0.898524);
+
+  // Snow and ice
+  img = img.where(img.eq(15), 0.082148);
+
+  // Barren / Sparse
+  img = img.where(img.eq(16), 0.17407);
+
+  // Water
+  img = img.where(img.eq(17), 0.354263);
+
+  return img.toFloat();
+}
+
+// SRmin / SRmax 仍采用原通用值
+function set_SRmin(image){
+  var img = image.where(image.gt(0), 1.05);
+  return img.toFloat();
+}
+
+function set_SRmax(image){
+  var img = image.where(image.eq(3), 6.63).where(image.eq(1), 4.67)
+                 .where(image.eq(2), 5.17).where(image.eq(4), 6.91)
+                 .where(image.eq(6), 4.49).where(image.eq(7), 4.49)
+                 .where(image.eq(8), 4.49).where(image.eq(9), 4.49)
+                 .where(image.gt(9), 4.44).where(image.eq(5), 5.85);
+  return img.toFloat();
+}
+
+// 生成 LUE/NDVI/SR 参数场
+var LUE     = landcover_final.map(generate_LUE).select(['LC_Type1'], ['LUE']);
+var NDVImin = landcover_final.map(set_NDVImin).select(['LC_Type1'], ['NDVI_min']);
+var NDVImax = landcover_final.map(set_NDVImax).select(['LC_Type1'], ['NDVI_max']);
+var SRmin   = landcover_final.map(set_SRmin).select(['LC_Type1'], ['SR_min']);
+var SRmax   = landcover_final.map(set_SRmax).select(['LC_Type1'], ['SR_max']);
+
+// 快速检查 NDVI_min / NDVI_max 范围（调试用）
+print('NDVI_min sample stats', NDVImin.first().reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: geom,
+  scale: 500,
+  maxPixels: 1e9
+}));
+
+print('NDVI_max sample stats', NDVImax.first().reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: geom,
+  scale: 500,
+  maxPixels: 1e9
+}));
+
+// ======================= 植被指数计算 ======================= //
+
+function Cal_index(image){
+  var red  = image.select('MODIS_Band1');
+  var Nir  = image.select('MODIS_Band2');
+  var Blue = image.select('MODIS_Band3');
+  var Green= image.select('MODIS_Band4');
+  var Swir = image.select('MODIS_Band6');
+
+  var NDVI = Nir.subtract(red).divide(Nir.add(red));
+  NDVI = NDVI.where(NDVI.gt(1), 1).where(NDVI.lt(-1), -1);
+
+  var NDWI = Green.subtract(Nir).divide(Green.add(Nir));
+  NDWI = NDWI.where(NDWI.gt(1), 1).where(NDWI.lt(-1), -1);
+
+  var NDBI = Swir.subtract(Nir).divide(Swir.add(Nir));
+  NDBI = NDBI.where(NDBI.gt(1), 1).where(NDBI.lt(-1), -1);
+
+  var NIRV = NDVI.multiply(Nir);
+  var SR   = ee.Image(1).add(NDVI).divide(ee.Image(1).subtract(NDVI));
+
+  return image.addBands(NDVI.rename('NDVI'))
+              .addBands(NDWI.rename('NDWI'))
+              .addBands(NDBI.rename('NDBI'))
+              .addBands(NIRV.rename('NIRV'))
+              .addBands(SR.rename('SR'));
+}
+
+var MODIS09_indices = MODIS09GA_Daily_averaged
+  .map(Cal_index)
+  .select(['NDVI','NDWI','NDBI','NIRV','SR']);
+
+// ======================= 参数场与指数合并 ======================= //
+
+function setyear(image){
+  var year_str = image.get('system:time_start');
+  var year = ee.Date(year_str).get('year');
+  return image.set({'year': year});
+}
+
+LUE           = LUE.map(setyear);
+NDVImin       = NDVImin.map(setyear);
+NDVImax       = NDVImax.map(setyear);
+SRmin         = SRmin.map(setyear);
+SRmax         = SRmax.map(setyear);
+MODIS09_indices = MODIS09_indices.map(setyear);
+
+var filterTimeEqminmax = ee.Filter.equals({
+  leftField:  'year',
+  rightField: 'year'
+});
+
+var innerJoinedIL_LUE = innerJoin.apply(MODIS09_indices, LUE, filterTimeEqminmax);
+var Indices_LUE = ee.ImageCollection(innerJoinedIL_LUE.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+var innerJoinedILL_Nm = innerJoin.apply(Indices_LUE, NDVImin, filterTimeEqminmax);
+var Indices_LLM = ee.ImageCollection(innerJoinedILL_Nm.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+var innerJoinedILL_NN = innerJoin.apply(Indices_LLM, NDVImax, filterTimeEqminmax);
+Indices_LLM = ee.ImageCollection(innerJoinedILL_NN.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+var innerJoinedILL_NNS = innerJoin.apply(Indices_LLM, SRmin, filterTimeEqminmax);
+Indices_LLM = ee.ImageCollection(innerJoinedILL_NNS.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+var innerJoinedILL_NNSR = innerJoin.apply(Indices_LLM, SRmax, filterTimeEqminmax);
+Indices_LLM = ee.ImageCollection(innerJoinedILL_NNSR.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+// ======================= 时间序列：月、年 ======================= //
+
+// 月尺度
+var start = ee.Date(startYear + '-01-01');
+var end   = ee.Date((endYear + 1) + '-01-31');  // 结束到 2011-01-31
+
+var n_months = end.difference(start, 'month').subtract(1);
+var months = ee.List.sequence(0, n_months).map(function(n) {
+  return start.advance(n, 'month');
+});
+
+// Topt：7 月平均温度均值 → 标定 Topt
+print(Climate_collection, 'Climate_collection');
+var T = Climate_collection
+  .filter(ee.Filter.eq('month', 7))
+  .select(['tmean'], ['T']);
+
+function getTopt(image){
+  var tmean = image.select('T');
+  var Topt_mean = ee.Number(
+    tmean.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: 500,
+      maxPixels: 1e9
+    }).values().get(0)
+  );
+  var Topt = ee.Image(Topt_mean).rename('Topt');
+  return image.addBands(Topt).clip(geom);
+}
+
+T = T.map(getTopt).select('Topt');
+
+// I：年度 Heat Index
+var I = Climate_collection.select('I_month');
+
+var n_years = end.difference(start, 'year').subtract(1);
+var years = ee.List.sequence(0, n_years).map(function(n){
+  return start.advance(n, 'year');
+});
+
+function makeYearlyComposite_I(date){
+  date = ee.Date(date);
+  return I.filterDate(date, date.advance(1, 'year'))
+          .sum()
+          .set('system:index', date.format('YYYY'))
+          .set('year', date.get('year'))
+          .set('system:time_start', date.millis())
+          .set('system:time_end',   date.advance(1, 'year').millis());
+}
+
+I = ee.ImageCollection.fromImages(years.map(makeYearlyComposite_I))
+  .select(['I_month'], ['I']);
+
+// 月尺度 VI 合成（Max NDVI）
+function makeMonthlyComposite_MOD09(date){
+  date = ee.Date(date);
+  return Indices_LLM.filterDate(date, date.advance(1, 'month'))
+                    .max()
+                    .set('system:index', date.format('YYYYMM'))
+                    .set('year', date.format('YYYY'))
+                    .set('system:time_start', date.millis())
+                    .set('system:time_end',   date.advance(1, 'month').millis());
+}
+
+Indices_LLM = ee.ImageCollection.fromImages(months.map(makeMonthlyComposite_MOD09));
+
+// 将气候 + VI 合并
+var MODIS_SR = Climate_collection.combine(Indices_LLM);
+
+// 合并 Topt
+var innerJoinedTopt = innerJoin.apply(MODIS_SR, T, filterTimeEqminmax);
+MODIS_SR = ee.ImageCollection(innerJoinedTopt.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+// 合并 I
+var innerJoinedClim = innerJoin.apply(MODIS_SR, I, filterTimeEqminmax);
+MODIS_SR = ee.ImageCollection(innerJoinedClim.map(function(feature){
+  return ee.Image.cat(feature.get('primary'), feature.get('secondary'));
+}));
+
+// ======================= 水分 & 温度胁迫 ======================= //
+
+function Calstress(image){
+  var I    = image.select('I');
+  var tmean= image.select('tmean');
+  var pre  = image.select('pr');
+  var Topt = image.select('Topt');
+
+  var a  = ee.Image().expression(
+    '(0.6751 * I ** 3 - 77.1 * I ** 2 + 17920 * I + 482390) / 1000000',
+    {I:I}
+  ).rename('a');
+  var Ep0 = ee.Image().expression(
+    '16 * (10 * d / b) ** c',
+    {d:tmean, b:I, c:a}
+  ).rename('Ep0');
+  var Rn  = ee.Image().expression(
+    '((a * b) ** 0.5) * (0.369 + 0.598 * (a / b) ** 0.5)',
+    {a:Ep0, b:pre}
+  );
+  var EET = ee.Image().expression(
+    'a * b * (a ** 2 + b ** 2 + a + b) / ((a + b) * (a ** 2 + b ** 2))',
+    {a:pre, b:Rn}
+  );
+  var PET = ee.Image().expression(
+    '(a + b) / 2',
+    {a:EET, b:Ep0}
+  );
+  var Wstress = ee.Image().expression(
+    '0.5 + 0.5 * (a / b)',
+    {a:EET, b:PET}
+  ).rename('Wstress');
+
+  var Tstress1 = ee.Image().expression(
+    '0.8 + 0.02 * a - 0.0005 * a ** 2',
+    {a:Topt}
+  );
+  Tstress1 = Tstress1.where(tmean.lt(-10), 0).rename('Tstress1');
+
+  var Tsigma2 = ee.Image().expression(
+    '1.184 / (1 + exp(0.2 * (a - 10 - b))) * 1 / (1 + exp(0.3 * (b - a - 10)))',
+    {a:Topt, b:tmean}
+  );
+  var Tsigma3 = ee.Image(1.184)
+    .divide(ee.Image(1).add(ee.Image(-2).exp()))
+    .multiply(ee.Image(1).divide(ee.Image(1).add(ee.Image(-3).exp())));
+
+  var diff  = tmean.subtract(Topt);
+  var diff1 = diff.where(diff.lt(-13), 0)
+                  .where(diff.gte(-13).and(diff.lte(10)), 1)
+                  .where(diff.gt(10), 0);
+  var diff2 = diff.where(diff.gte(-13).and(diff.lte(10)), 1)
+                  .where(diff.gt(10), 0)
+                  .where(diff.lt(-13), 0);
+  var Tstress2 = Tsigma2.multiply(diff1)
+                        .add(Tsigma3.multiply(diff2))
+                        .rename('Tstress2');
+
+  return image.addBands(Wstress)
+              .addBands(Tstress1)
+              .addBands(Tstress2)
+              .clip(geom);
+}
+
+MODIS_SR = MODIS_SR.map(Calstress);
+
+// ======================= FPAR / APAR / NPP ======================= //
+
+function CalFPAR(image){
+  var NDVI    = image.select('NDVI');
+  var SR      = image.select('SR');
+  var NDVImin = image.select('NDVI_min');
+  var NDVImax = image.select('NDVI_max');
+  var SRmin   = image.select('SR_min');
+  var SRmax   = image.select('SR_max');
+
+  var FPAR1 = NDVI.subtract(NDVImin)
+                  .divide(NDVImax.subtract(NDVImin))
+                  .multiply(ee.Image(0.949))
+                  .add(0.001);
+  var FPAR2 = SR.subtract(SRmin)
+                .divide(SRmax.subtract(SRmin))
+                .multiply(ee.Image(0.949))
+                .add(0.001);
+  var FPAR  = FPAR1.multiply(0.5).add(FPAR2.multiply(0.5));
+  FPAR = FPAR.where(FPAR.gt(0.95), 0.95)
+             .where(FPAR.lt(0.05), 0.05)
+             .rename('FPAR');
+
+  return image.addBands(FPAR).toFloat();
+}
+MODIS_SR = MODIS_SR.map(CalFPAR);
+
+function CalAPAR(image){
+  var FPAR = image.select('FPAR');
+  var Sol  = image.select('srad');
+
+  var APAR = FPAR.multiply(Sol).multiply(ee.Image(0.5)).rename('APAR');
+
+  var LUE      = image.select('LUE');
+  var Wstress  = image.select('Wstress');
+  var Tstress1 = image.select('Tstress1');
+  var Tstress2 = image.select('Tstress2');
+  var yupson   = Tstress1.multiply(Tstress2)
+                         .multiply(Wstress)
+                         .multiply(LUE)
+                         .rename('yupson');
+  var NPP = APAR.multiply(yupson).rename('NPP');
+
+  return image.addBands(NPP)
+              .addBands(yupson)
+              .addBands(APAR)
+              .toFloat();
+}
+MODIS_SR = MODIS_SR.map(CalAPAR);
+
+print('MODIS_SR (with NPP)', MODIS_SR);
+
+// 可视化参数
+var gppVis = {
+  min: 0.0,
+  max: 2000.0,
+  palette: ['bbe029', '0a9501', '074b03']
+};
+var nppVis = {
+  min: 0.0,
+  max: 10.0,
+  palette: ['bbe029', '0a9501', '074b03']
+};
+
+// ======================= 年 NPP 合成 ======================= //
+
+var NPP_month = MODIS_SR.select('NPP');
+print('NPP_month', NPP_month);
+
+function makeYearlyComposite_NPP(date){
+  date = ee.Date(date);
+  return NPP_month.filterDate(date, date.advance(1, 'year'))
+                  .sum()
+                  .set('system:index', date.format('YYYY'))
+                  .set('year', date.get('year'))
+                  .set('system:time_start', date.millis())
+                  .set('system:time_end',   date.advance(1, 'year').millis());
+}
+
+var NPP_Year = ee.ImageCollection.fromImages(years.map(makeYearlyComposite_NPP));
+print('NPP_Year', NPP_Year);
+
+// ======================= 2010 年 NPP 预览 + 导出 ======================= //
+
+// ======================= 2010 年 NPP 预览（降分辨率 + 小范围） ======================= //
+
+var yearToView = 2010;
+
+var NPP_2010 = NPP_Year.filter(ee.Filter.eq('year', yearToView)).first();
+print('NPP image for year', yearToView, NPP_2010);
+
+// 选一个用于预览的较简单区域：
+// 这里用 ROI 的外接矩形再简化一下，避免几何太复杂导致预览爆内存
+var previewGeom = geom.bounds().simplify(5000);  // 5 km 精度简化边界
+
+// 把预览用的 NPP 降到 2000 m 分辨率，只是为了在屏幕上看个大概形态
+var NPP_2010_preview = NPP_2010
+  .reproject('EPSG:4326', null, 5000)   // 2 km 预览
+  .clip(previewGeom);
+
+Map.centerObject(previewGeom, 6);
+Map.addLayer(NPP_2010_preview, gppVis, 'NPP_2010_preview');
+
+// 导出 2010 年 NPP（年累计）
+Export.image.toDrive({
+  image: NPP_2010,
+  description: 'NPP_' + yearToView,
+  folder: 'GEE_NPP',
+  fileNamePrefix: 'NPP_' + yearToView,
+  region: geom,
+  scale: 500,
+  maxPixels: 1e13
+});
